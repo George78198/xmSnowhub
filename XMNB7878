@@ -1,0 +1,356 @@
+game:GetService("VirtualInputManager"):SendKeyEvent(true, "W", false, game) wait(1) game:GetService("VirtualInputManager"):SendKeyEvent(false, "W", false, game) wait(2)
+
+-- 服务声明
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+
+-- HTTP客户端兼容性处理
+local httpRequest = (syn and syn.request) or (http and http.request) or http_request 
+    or (fluxus and fluxus.request) or request
+
+-- 本地玩家引用
+local localPlayer = Players.LocalPlayer
+local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+
+-- 配置参数
+local CONFIG = {
+    -- 时间控制
+    SERVER_STAY_TIME = 5,              -- 单服务器停留时间(秒)
+    SERVER_FETCH_RETRY_DELAY = 10,    -- 服务器列表获取失败重试间隔(秒)
+    ITEM_SCAN_TIMEOUT = 10,           -- 物品扫描超时(秒)
+    TELEPORT_COOLDOWN = 5,            -- 传送冷却时间(秒)
+    
+    -- 次数限制
+    MAX_PICKUP_ATTEMPTS = 5,          -- 最大拾取次数
+    MAX_SERVER_SCANS = 5,             -- 最大服务器扫描数量
+    
+    -- 区域设置
+    FORBIDDEN_ZONE = {
+        center = Vector3.new(352.884155, 13.0287256, -1353.05396),
+        radius = 80
+    },
+    BANK_VAULT_POSITION = CFrame.new(1078.08093, 6.24685, -343.95758),
+    
+    -- 服务器选择
+    MIN_PLAYERS = 5,                  -- 最低玩家数量要求
+    IDEAL_PLAYER_RANGE = {5, 35},     -- 最理想玩家数量范围
+    
+    -- 其他
+    NOTIFICATION_DURATION = 5,
+    SCRIPT_TIMEOUT = 120
+}
+
+-- 目标物品列表
+local TARGET_ITEMS = {
+    "Money Printer",
+    "Blue Candy Cane",
+    "Bunny Balloon",
+    "Ghost Balloon",
+    "Clover Balloon",
+    "Bat Balloon",
+    "Gold Clover Balloon",
+    "Golden Rose",
+    "Black Rose",
+    "Heart Balloon",
+    "Diamond Ring",
+    "Diamond",
+    "Void Gem",
+    "Dark Matter Gem",
+    "Rollie"
+}
+
+-- 状态变量
+local servers = {}
+local scriptStartTime = os.time()
+
+--[[ 显示通知 ]]
+local function showNotification(text, title)
+    StarterGui:SetCore("SendNotification", {
+        Title = title or "自动脚本提示",
+        Text = text,
+        Duration = CONFIG.NOTIFICATION_DURATION
+    })
+end
+
+--[[ 检查脚本超时 ]]
+local function checkTimeout()
+    return (os.time() - scriptStartTime) >= CONFIG.SCRIPT_TIMEOUT
+end
+
+--[[ 带重试的获取服务器列表 ]]
+local function fetchServerListWithRetry()
+    local retryCount = 0
+    
+    while true do
+        local success, result = pcall(function()
+            local url = string.format(
+                "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100", 
+                game.PlaceId
+            )
+            
+            local response = httpRequest({
+                Url = url,
+                Method = "GET",
+                Timeout = 10
+            })
+            
+            if not response then error("HTTP请求失败") end
+            if response.StatusCode ~= 200 then error("状态码: "..response.StatusCode) end
+            
+            local decoded = HttpService:JSONDecode(response.Body)
+            if not decoded or not decoded.data then error("无效的API响应") end
+            
+            -- 过滤服务器：只保留5人以上的服务器
+            local filtered = {}
+            local currentJobId = game.JobId
+            for _, server in ipairs(decoded.data) do
+                if server.playing > CONFIG.MIN_PLAYERS and 
+                   server.playing < server.maxPlayers and 
+                   server.id ~= currentJobId then
+                    table.insert(filtered, server)
+                end
+            end
+            
+            if #filtered == 0 then error("没有5人以上的可用服务器") end
+            
+            -- 按玩家数量排序(从少到多)
+            table.sort(filtered, function(a, b)
+                return a.playing < b.playing
+            end)
+            
+            return filtered
+        end)
+        
+        if success then return result end
+        
+        retryCount = retryCount + 1
+        warn("服务器列表获取失败(尝试"..retryCount.."):", result)
+        showNotification("获取服务器列表失败，10秒后重试...")
+        
+        -- 精确等待10秒
+        local waitStart = os.time()
+        while os.time() - waitStart < CONFIG.SERVER_FETCH_RETRY_DELAY do
+            task.wait(0.5)
+        end
+    end
+end
+
+--[[ 智能选择最佳服务器 ]]
+local function selectOptimalServer()
+    if #servers == 0 then return nil end
+    
+    -- 优先选择玩家数量在理想范围内的服务器(5-35人)
+    for _, server in ipairs(servers) do
+        if server.playing >= CONFIG.IDEAL_PLAYER_RANGE[1] and 
+           server.playing <= CONFIG.IDEAL_PLAYER_RANGE[2] then
+            showNotification(string.format("选择理想服务器(玩家: %d)", server.playing))
+            return server.id
+        end
+    end
+    
+    -- 如果没有理想服务器，选择第一个5人以上的服务器
+    for _, server in ipairs(servers) do
+        if server.playing > CONFIG.MIN_PLAYERS then
+            showNotification(string.format("选择可用服务器(玩家: %d)", server.playing))
+            return server.id
+        end
+    end
+    
+    return nil
+end
+
+--[[ 传送至服务器 ]]
+local function teleportToServer(serverId)
+    local success, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, serverId, localPlayer)
+    end)
+    
+    if not success then
+        warn("传送失败:", err)
+        showNotification("传送失败: "..string.sub(tostring(err), 1, 30))
+        return false
+    end
+    return true
+end
+
+--[[ 传送角色 ]]
+local function teleportTo(position)
+    if humanoidRootPart then
+        humanoidRootPart.CFrame = position
+        task.wait(0.2)
+    end
+end
+
+--[[ 扫描目标物品 ]]
+local function scanForTargetItems()
+    local foundItems = {}
+    
+    for _, itemFolder in pairs(workspace.Game.Entities.ItemPickup:GetChildren()) do
+        for _, item in pairs(itemFolder:GetChildren()) do
+            if not (item:IsA("MeshPart") or item:IsA("Part")) then continue end
+            
+            -- 禁区检查
+            local distance = (item.Position - CONFIG.FORBIDDEN_ZONE.center).Magnitude
+            if distance <= CONFIG.FORBIDDEN_ZONE.radius then continue end
+            
+            -- 检查目标物品
+            for _, child in pairs(item:GetChildren()) do
+                if child:IsA("ProximityPrompt") then
+                    for _, targetName in pairs(TARGET_ITEMS) do
+                        if child.ObjectText == targetName then
+                            table.insert(foundItems, {
+                                item = item,
+                                prompt = child,
+                                name = targetName
+                            })
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    return foundItems
+end
+
+--[[ 自动拾取物品 ]]
+local function autoPickItems()
+    local pickupCount = 0
+    local startTime = os.time()
+    
+    while task.wait(0.1) do
+        -- 超时检查
+        if checkTimeout() or (os.time() - startTime) >= CONFIG.SERVER_STAY_TIME then
+            showNotification("时间到，准备换服")
+            return false
+        end
+        
+        -- 拾取次数检查
+        if pickupCount >= CONFIG.MAX_PICKUP_ATTEMPTS then
+            showNotification("达到最大拾取次数")
+            return false
+        end
+        
+        -- 扫描物品
+        local items = scanForTargetItems()
+        if #items == 0 then
+            showNotification("未找到目标物品")
+            return true
+        end
+        
+        -- 处理找到的物品
+        for _, data in ipairs(items) do
+            if pickupCount >= CONFIG.MAX_PICKUP_ATTEMPTS then break end
+            
+            data.prompt.RequiresLineOfSight = false
+            data.prompt.HoldDuration = 0
+            
+            teleportTo(data.item.CFrame * CFrame.new(0, 2, 0))
+            fireproximityprompt(data.prompt)
+            
+            pickupCount = pickupCount + 1
+            showNotification(string.format("拾取 %s (%d/%d)", 
+                data.name, pickupCount, CONFIG.MAX_PICKUP_ATTEMPTS))
+            
+            task.wait(0.5)
+        end
+    end
+    
+    return false
+end
+
+--[[ 自动银行抢劫 ]]
+local function autoFarmBank()
+    local bankDoor = workspace:FindFirstChild("BankRobbery")
+    if not bankDoor then return false end
+    
+    bankDoor = bankDoor:FindFirstChild("VaultDoor")
+    local bankCash = workspace:FindFirstChild("BankRobbery"):FindFirstChild("BankCash")
+    if not bankDoor or not bankCash then return false end
+    
+    showNotification("开始银行抢劫流程")
+    local startTime = os.time()
+    
+    while task.wait(0.5) do
+        if checkTimeout() or (os.time() - startTime) > 60 then
+            showNotification("银行抢劫超时")
+            return false
+        end
+        
+        -- 第一阶段：打开金库
+        if bankDoor.Door.Attachment.ProximityPrompt.Enabled then
+            teleportTo(CONFIG.BANK_VAULT_POSITION)
+            bankDoor.Door.Attachment.ProximityPrompt.HoldDuration = 0
+            fireproximityprompt(bankDoor.Door.Attachment.ProximityPrompt)
+        
+        -- 第二阶段：拿取现金
+        elseif bankCash.Cash:FindFirstChild("Bundle") then
+            local targetPos = bankCash.Cash.Bundle:GetPivot().Position
+            local basePos = Vector3.new(targetPos.X, targetPos.Y - 5, targetPos.Z)
+            teleportTo(CFrame.new(basePos, basePos + (targetPos - basePos).Unit))
+            
+            if bankCash.Main.Attachment.ProximityPrompt then
+                bankCash.Main.Attachment.ProximityPrompt.HoldDuration = 0
+                fireproximityprompt(bankCash.Main.Attachment.ProximityPrompt)
+            end
+        
+        -- 完成条件
+        else
+            showNotification("银行抢劫完成")
+            return true
+        end
+    end
+end
+
+--[[ 主循环 ]]
+local function main()
+    -- 角色初始化
+    localPlayer.CharacterAdded:Connect(function(newCharacter)
+        character = newCharacter
+        humanoid = newCharacter:WaitForChild("Humanoid")
+        humanoidRootPart = newCharacter:WaitForChild("HumanoidRootPart")
+    end)
+    
+    -- 主流程
+    while true do
+        local success, err = pcall(function()
+            -- 获取服务器列表（自动重试并按玩家数排序）
+            servers = fetchServerListWithRetry()
+            showNotification(string.format("获取到%d个服务器(最少玩家: %d)", 
+                #servers, servers[1] and servers[1].playing or 0))
+            
+            -- 物品收集
+            if not autoPickItems() then
+                -- 银行抢劫
+                autoFarmBank()
+            end
+            
+            -- 智能选择并传送
+            showNotification("正在选择最佳服务器...")
+            local targetServer = selectOptimalServer()
+            
+            if targetServer and teleportToServer(targetServer) then
+                task.wait(CONFIG.TELEPORT_COOLDOWN)
+            else
+                showNotification("服务器选择失败，10秒后重试")
+                task.wait(CONFIG.SERVER_FETCH_RETRY_DELAY)
+            end
+        end)
+        
+        -- 错误处理
+        if not success then
+            warn("主循环错误:", err)
+            showNotification("发生错误，10秒后重试")
+            task.wait(CONFIG.SERVER_FETCH_RETRY_DELAY)
+        end
+    end
+end
+
+-- 启动脚本
+showNotification("脚本启动 - 寻找5人以上服务器")
+main()
